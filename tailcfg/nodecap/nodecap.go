@@ -433,6 +433,8 @@ const (
 	// UDP headers or checksums for equal-length GSO batches, without requiring
 	// a client release. See https://github.com/tailscale/tailscale/issues/19777.
 	NeverGSOEqualTail Cap = "never-gso-equal-tail"
+
+	Conn25Connector Cap = "conn25-connector-apps"
 )
 
 const (
