@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -1754,8 +1755,8 @@ func TestPktQueue(t *testing.T) {
 		s.perClientSendQueueDepth = 3
 
 		var q pktQueue
-		if _, ok := q.dequeue(s); ok {
-			t.Fatal("dequeue on empty queue reported ok")
+		if _, more, ok := q.dequeue(s); ok || more {
+			t.Fatal("dequeue on empty queue reported ok or more")
 		}
 		for i := range 3 {
 			dropped, wasEmpty, ok := q.enqueue(s, mkpkt(i))
@@ -1780,11 +1781,14 @@ func TestPktQueue(t *testing.T) {
 		}
 		var got []byte
 		for {
-			p, ok := q.dequeue(s)
+			p, more, ok := q.dequeue(s)
 			if !ok {
 				break
 			}
 			got = append(got, p.bs...)
+			if wantMore := len(got) < 3; more != wantMore {
+				t.Errorf("dequeue %d: more=%v, want %v", len(got), more, wantMore)
+			}
 		}
 		if want := "\x01\x02\x03"; string(got) != want {
 			t.Errorf("dequeued %q, want %q", got, want)
@@ -1840,7 +1844,7 @@ func TestPktQueue(t *testing.T) {
 		if q.ring != nil {
 			t.Error("zero-depth enqueue allocated a ring")
 		}
-		if _, ok := q.dequeue(s); ok {
+		if _, _, ok := q.dequeue(s); ok {
 			t.Error("dequeue on zero-depth queue reported ok")
 		}
 		q.close(s, func(pkt) { t.Error("close on empty queue dropped a packet") })
@@ -1861,7 +1865,8 @@ func TestSendPktHeadDropAttribution(t *testing.T) {
 	defer s.Close()
 	s.perClientSendQueueDepth = 1
 
-	dst := &sclient{s: s, key: key.NewNode().Public(), sendWake: make(chan struct{}, 1)}
+	dst := &sclient{s: s, key: key.NewNode().Public()}
+	dst.writerState.Store(packWriterState(writerStopped, 0)) // no conn to write to; sendPkt's wake is a no-op
 	first := &sclient{s: s, key: key.NewNode().Public()}
 	second := &sclient{s: s, key: key.NewNode().Public()}
 
@@ -1885,7 +1890,7 @@ func TestSendPktHeadDropAttribution(t *testing.T) {
 }
 
 // gatedConn is a derp.Conn whose Writes block until the test releases
-// them, one at a time, so a test can hold sendLoop inside a Flush.
+// them, one at a time, so a test can hold the writer inside a Flush.
 type gatedConn struct {
 	writes chan int      // receives len(p) as each Write begins
 	gate   chan struct{} // each Write completes on receiving from it
@@ -1921,30 +1926,23 @@ func (c *gatedConn) SetDeadline(time.Time) error      { return nil }
 func (c *gatedConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *gatedConn) SetWriteDeadline(time.Time) error { return nil }
 
-// TestSendLoopBufferedWriteFrames checks that the bufferedWriteFrames
+// TestWriterBufferedWriteFrames checks that the bufferedWriteFrames
 // histogram counts exactly the frames written per flush. In
-// particular a sendWake pass that itself writes nothing must not
+// particular a writer pass that itself writes nothing must not
 // inflate the count of the batch that follows it.
-func TestSendLoopBufferedWriteFrames(t *testing.T) {
+func TestWriterBufferedWriteFrames(t *testing.T) {
 	s := New(key.NewNode(), t.Logf)
 	defer s.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	conn := newGatedConn()
 	c := &sclient{
-		s:          s,
-		key:        key.NewNode().Public(),
-		nc:         conn,
-		bw:         &lazyBufioWriter{w: conn},
-		logf:       t.Logf,
-		ctx:        ctx,
-		sendWake:   make(chan struct{}, 1),
-		sendPongCh: make(chan [8]byte, 1),
-		peerGone:   make(chan peerGoneMsg),
+		s:    s,
+		key:  key.NewNode().Public(),
+		nc:   conn,
+		bw:   &lazyBufioWriter{w: conn},
+		logf: t.Logf,
 	}
-	done := make(chan error, 1)
-	go func() { done <- c.sendLoop(ctx) }()
+	c.runWriterFunc = c.runWriter
 
 	src := key.NewNode().Public()
 	send := func(n int) {
@@ -1954,25 +1952,27 @@ func TestSendLoopBufferedWriteFrames(t *testing.T) {
 			}
 		}
 	}
-	// awaitWrite waits for sendLoop to be blocked in a Write, which
+	// awaitWrite waits for the writer to be blocked in a Write, which
 	// happens only from Flush.
 	awaitWrite := func() {
 		t.Helper()
 		select {
 		case <-conn.writes:
 		case <-time.After(10 * time.Second):
-			t.Fatal("timeout waiting for sendLoop to flush")
+			t.Fatal("timeout waiting for the writer to flush")
 		}
 	}
 	release := func() { conn.gate <- struct{}{} }
 
-	// One packet: sendLoop writes it and blocks flushing it.
+	// One packet: it wakes a writer, which writes it and blocks
+	// flushing it.
 	send(1)
 	awaitWrite()
 
-	// While it's blocked, queue a batch. Its sendWake lands in the
-	// wake channel and is consumed by the blocking select after the
-	// first flush's observation, without writing anything itself.
+	// While it's blocked, queue a batch. Its wake sets a pending bit
+	// on the running writer, so after the first flush's observation
+	// the writer's park attempt fails and it drains again, without an
+	// observation for the wake itself.
 	const batch = 5
 	send(batch)
 	release()
@@ -1981,9 +1981,10 @@ func TestSendLoopBufferedWriteFrames(t *testing.T) {
 	awaitWrite()
 	release()
 
-	// A pong forces one more write and flush; once that Write has
-	// begun, the batch's observation has been recorded.
-	c.sendPongCh <- [8]byte{}
+	// The writer has parked, or is about to. A pong wakes it again
+	// for one more write and flush; once that Write has begun, the
+	// batch's observation has been recorded.
+	c.queuePong([8]byte{})
 	awaitWrite()
 
 	var h map[string]float64
@@ -1998,8 +1999,213 @@ func TestSendLoopBufferedWriteFrames(t *testing.T) {
 	}
 
 	release()
-	cancel()
-	if err := <-done; err != nil {
-		t.Errorf("sendLoop: %v", err)
+	c.stopWriter()
+	if c.writeErr != nil {
+		t.Errorf("writer: %v", c.writeErr)
 	}
+	if got := c.writerState.Load(); got.phase() != writerStopped {
+		t.Errorf("writer phase = %d; want writerStopped (%d)", got.phase(), writerStopped)
+	}
+}
+
+// writerTestClient is a DERP client connected over TCP loopback to an
+// in-process Server, for tests of the server's per-client writer.
+type writerTestClient struct {
+	c      *derp.Client
+	nc     net.Conn
+	key    key.NodePrivate
+	cancel context.CancelFunc
+}
+
+// newWriterTestClient connects a new client to s. Its Accept goroutine
+// is the connection's reader; the test's caller owns the client side.
+func newWriterTestClient(t *testing.T, s *Server, ln net.Listener) *writerTestClient {
+	t.Helper()
+	connOut, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	connIn, err := ln.Accept()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	brwServer := bufio.NewReadWriter(bufio.NewReader(connIn), bufio.NewWriter(connIn))
+	go s.Accept(ctx, connIn, brwServer, connIn.RemoteAddr().String())
+
+	k := key.NewNode()
+	brw := bufio.NewReadWriter(bufio.NewReader(connOut), bufio.NewWriter(connOut))
+	c, err := derp.NewClient(k, connOut, brw, logger.Discard)
+	if err != nil {
+		cancel()
+		t.Fatalf("client: %v", err)
+	}
+	return &writerTestClient{c: c, nc: connOut, key: k, cancel: cancel}
+}
+
+func (tc *writerTestClient) close() {
+	tc.nc.Close()
+	tc.cancel()
+}
+
+// sendToSelf sends a packet to the client itself and waits to receive
+// it back, exercising the server's writer for that client.
+func (tc *writerTestClient) sendToSelf(t *testing.T, payload []byte) {
+	t.Helper()
+	if err := tc.c.Send(tc.key.Public(), payload); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	for {
+		tc.nc.SetReadDeadline(time.Now().Add(10 * time.Second))
+		m, err := tc.c.Recv()
+		if err != nil {
+			t.Fatalf("Recv: %v", err)
+		}
+		if rp, ok := m.(derp.ReceivedPacket); ok {
+			if !bytes.Equal(rp.Data, payload) {
+				t.Fatalf("got packet %q; want %q", rp.Data, payload)
+			}
+			return
+		}
+	}
+}
+
+// awaitGoroutines waits for the process's goroutine count to settle at
+// want, tolerating transient goroutines such as timer callbacks.
+func awaitGoroutines(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		got := runtime.NumGoroutine()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			buf := make([]byte, 1<<20)
+			t.Fatalf("goroutines = %d; want %d\n%s", got, want, buf[:runtime.Stack(buf, true)])
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestWriterParksWhenIdle locks in that an idle connection costs the
+// server exactly one goroutine, its reader, both when it has never
+// been written to and after its writer has run and parked again.
+func TestWriterParksWhenIdle(t *testing.T) {
+	s := New(key.NewNode(), t.Logf)
+	defer s.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	base := runtime.NumGoroutine()
+
+	const numClients = 20
+	var clients []*writerTestClient
+	for range numClients {
+		clients = append(clients, newWriterTestClient(t, s, ln))
+	}
+	defer func() {
+		for _, tc := range clients {
+			tc.close()
+		}
+	}()
+	// Accepting a client also handed it its ServerInfo frame, so the
+	// writer ran once already. It must have parked.
+	awaitGoroutines(t, base+numClients)
+
+	for i, tc := range clients {
+		tc.sendToSelf(t, []byte(strconv.Itoa(i)))
+	}
+	awaitGoroutines(t, base+numClients)
+
+	for _, tc := range clients {
+		tc.close()
+	}
+	clients = nil
+	awaitGoroutines(t, base)
+}
+
+// TestWriterWakeStress races the writer's park decision against
+// producers on several goroutines and checks that nothing is lost:
+// every packet, sent one at a time so the writer parks between them,
+// and every peer gone request, which the writer must deliver exactly.
+func TestWriterWakeStress(t *testing.T) {
+	s := New(key.NewNode(), logger.Discard)
+	defer s.Close()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	tc := newWriterTestClient(t, s, ln)
+	defer tc.close()
+
+	var sc *sclient
+	for deadline := time.Now().Add(10 * time.Second); sc == nil; {
+		if set, ok := s.clients.Load(tc.key.Public()); ok {
+			sc = set.activeClient.Load()
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("client never registered")
+		}
+	}
+
+	const (
+		producers      = 4
+		gonePerProd    = 500
+		packets        = 500
+		wantGone       = producers * gonePerProd
+		wantPacketData = "hi"
+	)
+	gonePeer := key.NewNode().Public()
+	var wg sync.WaitGroup
+	for range producers {
+		wg.Go(func() {
+			for range gonePerProd {
+				sc.requestPeerGoneWrite(gonePeer, derp.PeerGoneReasonDisconnected)
+			}
+		})
+	}
+
+	gotGone, gotPackets := 0, 0
+	sent := 0
+	if err := tc.c.Send(tc.key.Public(), []byte(wantPacketData)); err != nil {
+		t.Fatal(err)
+	}
+	sent++
+	for gotGone < wantGone || gotPackets < packets {
+		tc.nc.SetReadDeadline(time.Now().Add(30 * time.Second))
+		m, err := tc.c.Recv()
+		if err != nil {
+			t.Fatalf("Recv after %d gone, %d packets: %v", gotGone, gotPackets, err)
+		}
+		switch m := m.(type) {
+		case derp.PeerGoneMessage:
+			if m.Peer != gonePeer {
+				t.Fatalf("PeerGone for %v; want %v", m.Peer, gonePeer)
+			}
+			gotGone++
+		case derp.ReceivedPacket:
+			if string(m.Data) != wantPacketData {
+				t.Fatalf("packet %q; want %q", m.Data, wantPacketData)
+			}
+			gotPackets++
+			if sent < packets {
+				// Each packet goes out only once the previous one
+				// came back, so the writer had a chance to park in
+				// between.
+				if err := tc.c.Send(tc.key.Public(), []byte(wantPacketData)); err != nil {
+					t.Fatal(err)
+				}
+				sent++
+			}
+		}
+	}
+	wg.Wait()
 }
